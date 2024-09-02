@@ -14,6 +14,11 @@ import { JwtService } from '@nestjs/jwt';
 import jwtConfig from '../config/jwt.config';
 import { ConfigType } from '@nestjs/config';
 import { ActiveUserData } from '../interfaces/active-user-data.interface';
+import { RefreshTokenDto } from './dto/refresh-token-dto';
+import { RefreshTokenIdsStorageService } from 'src/common/redis/services/refresh-token-ids.storage.service';
+import { USER_KEY } from 'src/common/redis/constants/user-key.constant';
+import { randomUUID } from 'crypto';
+import { InvalidatedStoredValueException } from 'src/common/redis/utils/invalidate-stored-value.exception';
 
 @Injectable()
 export class AuthenticationService {
@@ -23,6 +28,7 @@ export class AuthenticationService {
     private readonly jwtService: JwtService,
     @Inject(jwtConfig.KEY)
     private readonly jwtConfiguration: ConfigType<typeof jwtConfig>,
+    private readonly refreshTokenIdsStorageService: RefreshTokenIdsStorageService,
   ) {}
 
   async signUp(signUpDto: SignUpDto) {
@@ -60,21 +66,74 @@ export class AuthenticationService {
       throw new UnauthorizedException('Password does not match');
     }
 
-    const accessToken = await this.jwtService.signAsync(
+    return await this.generateTokens(user);
+  }
+
+  async generateTokens(user: User) {
+    const refreshTokenId = randomUUID();
+    const [accessToken, refreshToken] = await Promise.all([
+      await this.signToken<Partial<ActiveUserData>>(
+        user.id,
+        this.jwtConfiguration.accessTokenTtl,
+        { email: user.email },
+      ),
+      await this.signToken(user.id, this.jwtConfiguration.refreshTokenTtl, {
+        refreshTokenId,
+      }),
+    ]);
+    await this.refreshTokenIdsStorageService.insert(
+      USER_KEY,
+      user.id,
+      refreshTokenId,
+    );
+    return { accessToken, refreshToken };
+  }
+
+  async refreshTokens(refreshTokenDto: RefreshTokenDto) {
+    try {
+      const { sub, refreshTokenId } = await this.jwtService.verifyAsync<
+        Pick<ActiveUserData, 'sub'> & { refreshTokenId: string }
+      >(refreshTokenDto.refreshToken, {
+        secret: this.jwtConfiguration.secret,
+        audience: this.jwtConfiguration.audience,
+        issuer: this.jwtConfiguration.issuer,
+      });
+      const user = await this.usersRepository.findOneByOrFail({
+        id: sub,
+      });
+      const isValid = await this.refreshTokenIdsStorageService.validate(
+        USER_KEY,
+        user.id,
+        refreshTokenId,
+      );
+
+      if (isValid) {
+        await this.refreshTokenIdsStorageService.inValidate(USER_KEY, user.id);
+      } else {
+        throw new Error('Refresh token is invalid');
+      }
+
+      return this.generateTokens(user);
+    } catch (err) {
+      if (err instanceof InvalidatedStoredValueException) {
+        throw new UnauthorizedException('Access denied');
+      }
+      throw new UnauthorizedException();
+    }
+  }
+
+  private async signToken<T>(userId: number, expiresIn: number, payload?: T) {
+    return await this.jwtService.signAsync(
       {
-        sub: user.id,
-        email: user.email,
-      } as ActiveUserData,
+        sub: userId,
+        ...payload,
+      },
       {
         audience: this.jwtConfiguration.audience,
         issuer: this.jwtConfiguration.issuer,
         secret: this.jwtConfiguration.secret,
-        expiresIn: this.jwtConfiguration.accessTokenTtl,
+        expiresIn,
       },
     );
-
-    return {
-      accessToken,
-    };
   }
 }

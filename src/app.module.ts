@@ -6,6 +6,7 @@ import { UsersModule } from './users/users.module';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { IamModule } from './iam/iam.module';
 import { ConfigModule } from '@nestjs/config';
+import { RedisModule } from './common/redis/redis.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { ConfigModule } from '@nestjs/config';
     CoffeesModule,
     UsersModule,
     IamModule,
+    RedisModule,
   ],
   controllers: [AppController],
   providers: [AppService],

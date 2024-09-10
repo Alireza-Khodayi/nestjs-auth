@@ -12,12 +12,16 @@ import { APP_GUARD } from '@nestjs/core';
 import { AuthenticationGuard } from './authentication/guards/authentication.guard';
 import { AccessTokenGuard } from './authentication/guards/access-token.guard';
 import { RedisModule } from 'src/common/redis/redis.module';
+import { Role } from 'src/users/roles/entities/role.entity';
+import { RolesModule } from 'src/users/roles/roles.module';
+import { RolesGuard } from './authorization/guards/roles.guard';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User]),
+    TypeOrmModule.forFeature([User, Role]),
     JwtModule.registerAsync(jwtConfig.asProvider()),
     ConfigModule.forFeature(jwtConfig),
+    RolesModule,
     RedisModule,
   ],
   providers: [
@@ -29,9 +33,14 @@ import { RedisModule } from 'src/common/redis/redis.module';
       provide: APP_GUARD,
       useClass: AuthenticationGuard,
     },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
     AccessTokenGuard,
     AuthenticationService,
   ],
   controllers: [AuthenticationController],
+  exports: [HashingService],
 })
 export class IamModule {}

@@ -1,3 +1,5 @@
+import { Role } from 'src/users/roles/entities/role.entity';
+
 export interface ActiveUserData {
   /**
    * The "subject" of the token. The value of this property is the user ID
@@ -8,4 +10,8 @@ export interface ActiveUserData {
    * The subject's (user) email.
    */
   email: string;
+  /**
+   * The subject's (user) role.
+   */
+  role: Role;
 }

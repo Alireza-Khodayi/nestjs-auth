@@ -2,6 +2,7 @@ import {
   ConflictException,
   Inject,
   Injectable,
+  OnModuleInit,
   UnauthorizedException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -19,11 +20,13 @@ import { RefreshTokenIdsStorageService } from 'src/common/redis/services/refresh
 import { USER_KEY } from 'src/common/redis/constants/user-key.constant';
 import { randomUUID } from 'crypto';
 import { InvalidatedStoredValueException } from 'src/common/redis/utils/invalidate-stored-value.exception';
+import { Role } from 'src/users/roles/entities/role.entity';
 
 @Injectable()
-export class AuthenticationService {
+export class AuthenticationService implements OnModuleInit {
   constructor(
     @InjectRepository(User) private readonly usersRepository: Repository<User>,
+    @InjectRepository(Role) private readonly rolesRepository: Repository<Role>,
     private readonly hashingService: HashingService,
     private readonly jwtService: JwtService,
     @Inject(jwtConfig.KEY)
@@ -36,7 +39,19 @@ export class AuthenticationService {
       const user = new User();
       user.email = signUpDto.email;
       user.password = await this.hashingService.hash(signUpDto.password);
+      const userRole = await this.rolesRepository.findOne({
+        where: { roleName: 'user' },
+      });
 
+      if (userRole) {
+        user.role = userRole;
+        await this.usersRepository.save(user);
+        console.log(`User created: ${user.email}`);
+      } else {
+        throw new Error(
+          'User role does not exist. Please create the user role first.',
+        );
+      }
       await this.usersRepository.save(user);
     } catch (err) {
       const pgUniqueViolationErrorCode = '23505';
@@ -49,10 +64,12 @@ export class AuthenticationService {
   }
 
   async signIn(signInDto: SignInDto) {
-    const user = await this.usersRepository.findOneBy({
-      email: signInDto.email,
+    const user = await this.usersRepository.findOne({
+      where: {
+        email: signInDto.email,
+      },
+      relations: ['role'],
     });
-
     if (!user) {
       throw new UnauthorizedException('User does not exists');
     }
@@ -71,11 +88,12 @@ export class AuthenticationService {
 
   async generateTokens(user: User) {
     const refreshTokenId = randomUUID();
+    console.log(user.role);
     const [accessToken, refreshToken] = await Promise.all([
       await this.signToken<Partial<ActiveUserData>>(
         user.id,
         this.jwtConfiguration.accessTokenTtl,
-        { email: user.email },
+        { email: user.email, role: user.role },
       ),
       await this.signToken(user.id, this.jwtConfiguration.refreshTokenTtl, {
         refreshTokenId,
@@ -135,5 +153,40 @@ export class AuthenticationService {
         expiresIn,
       },
     );
+  }
+
+  async onModuleInit() {
+    await this.createInitialAdminUser();
+  }
+
+  private async createInitialAdminUser() {
+    const adminEmail = 'admin@example.com'; // Change this to your desired admin email
+    const adminPassword = 'adminPassword'; // Change this to your desired admin password
+
+    const existingAdmin = await this.usersRepository.findOne({
+      where: { email: adminEmail },
+    });
+
+    if (!existingAdmin) {
+      const user = new User();
+      user.email = adminEmail;
+      user.password = await this.hashingService.hash(adminPassword);
+
+      // Fetch the admin role
+      const adminRole = await this.rolesRepository.findOne({
+        where: { roleName: 'admin' },
+      });
+
+      if (adminRole) {
+        user.role = adminRole;
+        await this.usersRepository.save(user);
+        console.log(user.role);
+        console.log(`Admin user created: ${adminEmail}`);
+      } else {
+        console.error(
+          'Admin role does not exist. Please create the admin role first.',
+        );
+      }
+    }
   }
 }

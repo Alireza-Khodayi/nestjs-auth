@@ -7,9 +7,15 @@ services:
     ports:
       - '5432:5432'
     environment:
-      - POSTGRES_PASSWORD=pass1234
+      - POSTGRES_PASSWORD=pass1234 # Set the password for the user
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Persist data
+
   redis:
     image: redis
     ports:
       - '6379:6379'
     restart: always
+
+volumes:
+  postgres_data: # Define a volume for PostgreSQL data persistence

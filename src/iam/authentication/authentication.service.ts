@@ -6,7 +6,6 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { User } from 'src/users/entities/user.entity';
 import { Repository } from 'typeorm';
 import { HashingService } from '../hashing/hashing.service';
 import { SignUpDto } from './dto/sign-up.dto';
@@ -16,11 +15,12 @@ import jwtConfig from '../config/jwt.config';
 import { ConfigType } from '@nestjs/config';
 import { ActiveUserData } from '../interfaces/active-user-data.interface';
 import { RefreshTokenDto } from './dto/refresh-token-dto';
-import { RefreshTokenIdsStorageService } from 'src/common/redis/services/refresh-token-ids.storage.service';
-import { USER_KEY } from 'src/common/redis/constants/user-key.constant';
+import { USER_KEY } from 'src/iam/constants/user-key.constant';
 import { randomUUID } from 'crypto';
-import { InvalidatedStoredValueException } from 'src/common/redis/utils/invalidate-stored-value.exception';
-import { Role } from 'src/users/roles/entities/role.entity';
+import { RefreshTokenStorage } from './storages/refresh-token.storage';
+import { User } from 'src/users/entities/user.entity';
+import { Role } from '../roles/entities/role.entity';
+import iamConfig from '../config/iam.config';
 
 @Injectable()
 export class AuthenticationService implements OnModuleInit {
@@ -31,121 +31,96 @@ export class AuthenticationService implements OnModuleInit {
     private readonly jwtService: JwtService,
     @Inject(jwtConfig.KEY)
     private readonly jwtConfiguration: ConfigType<typeof jwtConfig>,
-    private readonly refreshTokenIdsStorageService: RefreshTokenIdsStorageService,
+    @Inject(iamConfig.KEY)
+    private readonly iamConfiguration: ConfigType<typeof iamConfig>,
+    private readonly refreshTokenStorage: RefreshTokenStorage,
   ) {}
 
-  async signUp(signUpDto: SignUpDto) {
-    try {
-      const user = new User();
-      user.email = signUpDto.email;
-      user.password = await this.hashingService.hash(signUpDto.password);
-      const userRole = await this.rolesRepository.findOne({
-        where: { roleName: 'user' },
-      });
+  async onModuleInit() {
+    await this.createInitialAdminUser();
+  }
 
-      if (userRole) {
-        user.role = userRole;
-        await this.usersRepository.save(user);
-        console.log(`User created: ${user.email}`);
-      } else {
-        throw new Error(
-          'User role does not exist. Please create the user role first.',
+  private async createInitialAdminUser() {
+    const existingAdmin = await this.usersRepository.findOne({
+      where: { email: this.iamConfiguration.adminEmail },
+    });
+    if (!existingAdmin) {
+      const adminRole = await this.getUserRole(
+        this.iamConfiguration.defaultAdminRoleName,
+      );
+      if (!adminRole) {
+        console.error(
+          'Admin role does not exist. Please create the admin role first.',
         );
+        return;
       }
-      await this.usersRepository.save(user);
-    } catch (err) {
-      const pgUniqueViolationErrorCode = '23505';
+      const adminUser = await this.createUser(
+        this.iamConfiguration.adminEmail,
+        this.iamConfiguration.adminPassword,
+        adminRole,
+      );
 
-      if (err.code === pgUniqueViolationErrorCode) {
-        throw new ConflictException();
-      }
-      throw err;
+      await this.usersRepository.save(adminUser);
+    }
+  }
+
+  async signUp(signUpDto: SignUpDto) {
+    const userRole = await this.getUserRole(
+      this.iamConfiguration.defaultUserRoleName,
+    );
+    if (!userRole) {
+      throw new Error(
+        'User role does not exist. Please create the user role first.',
+      );
+    }
+
+    const user = await this.createUser(
+      signUpDto.email,
+      signUpDto.password,
+      userRole,
+    );
+    try {
+      await this.usersRepository.save(user);
+      console.log(`User created: ${user.email}`);
+    } catch (err) {
+      this.handleDatabaseViolationError(err);
     }
   }
 
   async signIn(signInDto: SignInDto) {
-    const user = await this.usersRepository.findOne({
-      where: {
-        email: signInDto.email,
-      },
-      relations: ['role'],
-    });
-    if (!user) {
-      throw new UnauthorizedException('User does not exists');
-    }
-
-    const isEqual = await this.hashingService.compare(
-      signInDto.password,
-      user.password,
-    );
-
-    if (!isEqual) {
-      throw new UnauthorizedException('Password does not match');
-    }
-
-    return await this.generateTokens(user);
+    const user = await this.findUserByEmail(signInDto.email);
+    await this.validatePassword(signInDto.password, user.password);
+    return this.generateTokens(user);
   }
 
-  async generateTokens(user: User) {
+  async refreshTokens(refreshTokenDto: RefreshTokenDto) {
+    const { sub, refreshTokenId } = await this.verifyRefreshToken(
+      refreshTokenDto.refreshToken,
+    );
+    const user = await this.usersRepository.findOneByOrFail({ id: sub });
+    await this.validateRefreshToken(user.id, refreshTokenId);
+    return this.generateTokens(user);
+  }
+
+  private async generateTokens(user: User) {
     const refreshTokenId = randomUUID();
-    console.log(user.role);
     const [accessToken, refreshToken] = await Promise.all([
-      await this.signToken<Partial<ActiveUserData>>(
+      this.signToken<Partial<ActiveUserData>>(
         user.id,
         this.jwtConfiguration.accessTokenTtl,
         { email: user.email, role: user.role },
       ),
-      await this.signToken(user.id, this.jwtConfiguration.refreshTokenTtl, {
+      this.signToken(user.id, this.jwtConfiguration.refreshTokenTtl, {
         refreshTokenId,
       }),
     ]);
-    await this.refreshTokenIdsStorageService.insert(
-      USER_KEY,
-      user.id,
-      refreshTokenId,
-    );
+    await this.refreshTokenStorage.insert(USER_KEY, user.id, refreshTokenId);
     return { accessToken, refreshToken };
   }
 
-  async refreshTokens(refreshTokenDto: RefreshTokenDto) {
-    try {
-      const { sub, refreshTokenId } = await this.jwtService.verifyAsync<
-        Pick<ActiveUserData, 'sub'> & { refreshTokenId: string }
-      >(refreshTokenDto.refreshToken, {
-        secret: this.jwtConfiguration.secret,
-        audience: this.jwtConfiguration.audience,
-        issuer: this.jwtConfiguration.issuer,
-      });
-      const user = await this.usersRepository.findOneByOrFail({
-        id: sub,
-      });
-      const isValid = await this.refreshTokenIdsStorageService.validate(
-        USER_KEY,
-        user.id,
-        refreshTokenId,
-      );
-
-      if (isValid) {
-        await this.refreshTokenIdsStorageService.inValidate(USER_KEY, user.id);
-      } else {
-        throw new Error('Refresh token is invalid');
-      }
-
-      return this.generateTokens(user);
-    } catch (err) {
-      if (err instanceof InvalidatedStoredValueException) {
-        throw new UnauthorizedException('Access denied');
-      }
-      throw new UnauthorizedException();
-    }
-  }
-
   private async signToken<T>(userId: number, expiresIn: number, payload?: T) {
-    return await this.jwtService.signAsync(
-      {
-        sub: userId,
-        ...payload,
-      },
+    return this.jwtService.signAsync(
+      { sub: userId, ...payload },
       {
         audience: this.jwtConfiguration.audience,
         issuer: this.jwtConfiguration.issuer,
@@ -155,38 +130,72 @@ export class AuthenticationService implements OnModuleInit {
     );
   }
 
-  async onModuleInit() {
-    await this.createInitialAdminUser();
+  private async verifyRefreshToken(token: string) {
+    return this.jwtService.verifyAsync<
+      Pick<ActiveUserData, 'sub'> & { refreshTokenId: string }
+    >(token, {
+      secret: this.jwtConfiguration.secret,
+      audience: this.jwtConfiguration.audience,
+      issuer: this.jwtConfiguration.issuer,
+    });
   }
 
-  private async createInitialAdminUser() {
-    const adminEmail = 'admin@example.com'; // Change this to your desired admin email
-    const adminPassword = 'adminPassword'; // Change this to your desired admin password
-
-    const existingAdmin = await this.usersRepository.findOne({
-      where: { email: adminEmail },
-    });
-
-    if (!existingAdmin) {
-      const user = new User();
-      user.email = adminEmail;
-      user.password = await this.hashingService.hash(adminPassword);
-
-      // Fetch the admin role
-      const adminRole = await this.rolesRepository.findOne({
-        where: { roleName: 'admin' },
-      });
-
-      if (adminRole) {
-        user.role = adminRole;
-        await this.usersRepository.save(user);
-        console.log(user.role);
-        console.log(`Admin user created: ${adminEmail}`);
-      } else {
-        console.error(
-          'Admin role does not exist. Please create the admin role first.',
-        );
-      }
+  private async validateRefreshToken(userId: number, refreshTokenId: string) {
+    const isValid = await this.refreshTokenStorage.validate(
+      USER_KEY,
+      userId,
+      refreshTokenId,
+    );
+    if (!isValid) {
+      throw new UnauthorizedException('Refresh token is invalid');
     }
+    await this.refreshTokenStorage.inValidate(USER_KEY, userId);
+  }
+
+  private async findUserByEmail(email: string): Promise<User> {
+    const user = await this.usersRepository.findOne({
+      where: { email },
+      relations: ['role'],
+    });
+    if (!user) {
+      throw new UnauthorizedException('User does not exist');
+    }
+    return user;
+  }
+
+  private async validatePassword(
+    plainPassword: string,
+    hashedPassword: string,
+  ) {
+    const isEqual = await this.hashingService.compare(
+      plainPassword,
+      hashedPassword,
+    );
+    if (!isEqual) {
+      throw new UnauthorizedException('Password does not match');
+    }
+  }
+
+  private async getUserRole(roleName: string): Promise<Role | null> {
+    return this.rolesRepository.findOne({ where: { roleName } });
+  }
+
+  private async createUser(
+    email: string,
+    password: string,
+    role: Role,
+  ): Promise<User> {
+    const user = new User();
+    user.email = email;
+    user.password = await this.hashingService.hash(password);
+    user.role = role;
+    return user;
+  }
+
+  private handleDatabaseViolationError(err: any) {
+    if (err.code === this.iamConfiguration.pgViolationErrorCode) {
+      throw new ConflictException('A user already exists with this email!');
+    }
+    throw err;
   }
 }

@@ -1,8 +1,8 @@
 import { Injectable } from '@nestjs/common';
-import { RedisService } from '../redis.service';
+import { RedisService } from 'src/common/redis/redis.service';
 
 @Injectable()
-export class RefreshTokenIdsStorageService {
+export class RefreshTokenStorage {
   constructor(private readonly redisService: RedisService) {}
 
   async insert(

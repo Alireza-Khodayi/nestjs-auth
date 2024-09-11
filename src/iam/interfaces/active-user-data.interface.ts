@@ -1,4 +1,4 @@
-import { Role } from 'src/users/roles/entities/role.entity';
+import { Role } from '../roles/entities/role.entity';
 
 export interface ActiveUserData {
   /**
